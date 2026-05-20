@@ -1,6 +1,6 @@
 #pragma once
 
-/* ase_read.h */
+/* ase_file */
 /* Provided under the terms of the MIT license. See the end of the file for license details. */
 
 #include <stdint.h>
@@ -11,11 +11,20 @@
 extern "C" {
 #endif
 
-// Use this if you want to use libdeflate instead of sinfl, it's approximately 35% faster at decompressing but also a much larger and bulkier implementation.
-//#define ASE_USE_LIBDEFLATE
+// Verbose mode prints the file structure of asesprite files while parsing. This is just for debugging corrupt/incompatible files you encounter.
+//#define ASE_VERBOSE
+
+// Zlib compression level to use for writing.
+// For reference (size and speed refers to the entire aseprite file, not just zlib compressed part):
+// 1 (min) - ~50% faster than 5, but ~14% bigger.
+// 3       - ~35% faster than 5, but ~7% bigger. Default for ase_file.
+// 5       - Reference.
+// 6       - ~50% slower than 5, but ~1% smaller. Default for Aseprite. 
+// 9 (max) - ~700% slower than 5, but ~4% smaller.
+#define ASE_COMPRESSION_LEVEL 3
 
 /* ======================= High Level API ====================== */
-struct AsePixelData
+typedef struct AsePixelData
 {
     uint8_t* data;
     int      length;
@@ -25,15 +34,15 @@ struct AsePixelData
     bool     is_trimmed;
     uint16_t trimmed_x, trimmed_y;
     uint16_t trimmed_w, trimmed_h;
-};
+} AsePixelData;
 
-struct AseUserData
+typedef struct AseUserData
 {
     uint32_t    color;
     const char* text;
-};
+} AseUserData;
 
-struct AseCel
+typedef struct AseCel
 {
     int pixel_data_index;
     int16_t         x, y;
@@ -42,9 +51,9 @@ struct AseCel
     uint8_t      opacity;
 
     struct AseUserData user_data;
-};
+} AseCel;
 
-struct AseLayer
+typedef struct AseLayer
 {
     const char* name;
     bool     visible;
@@ -55,29 +64,30 @@ struct AseLayer
     int        depth;
 
     struct AseUserData user_data;
-};
+} AseLayer;
 
-struct AseTag
+typedef struct AseTag
 {
     const char* name;
     int  start_frame;
     int    end_frame;
 
     struct AseUserData user_data;
-};
+} AseTag;
 
-struct AsePalette
+typedef struct AsePalette
 {
     uint32_t colors[256];
-};
+    int num_colors;
+} AsePalette;
 
-struct AseFrame
+typedef struct AseFrame
 {
     struct AsePalette* palette;
     float              duration;
-};
+} AseFrame;
 
-struct AseSlice
+typedef struct AseSlice
 {
     const    char* name;
     int32_t  slice_x, slice_y;
@@ -91,9 +101,9 @@ struct AseSlice
     int32_t pivot_x, pivot_y;
 
     struct AseUserData user_data;
-};
+} AseSlice;
 
-struct AseFile
+typedef struct AseFile
 {
     uint16_t width, height;
     uint16_t pixel_ratio_x, pixel_ratio_y; // 1:1, 1:2 or 2:1
@@ -113,17 +123,25 @@ struct AseFile
     int num_tags;
     int num_palettes;
     int num_slices;
+
     // All data referenced by AseFile (included the AseFile itself) is stored in one continuous buffer.
     char* data;
     int   data_length;
 
     struct AseUserData user_data;
-};
+} AseFile;
 
+// Read API
 struct AseFile* ase_read_file(const char* path);
 void            ase_free_file(struct AseFile* file);
-// For creating texture atlases for GPU rendering.
+// Write API
+int      ase_file_calculate_memory_needed(struct AseFile* file);
+uint8_t* ase_file_init_with_buffer(struct AseFile* file, uint8_t* memory, int size);
+bool     ase_write_file(struct AseFile* file, const char* path);
+// Optimization API
 bool ase_trim_pixels(struct AseFile* file, int pixel_data_index);
+//bool ase_optimize(struct AseFile* file);
+// For creating texture atlases for GPU rendering.
 bool ase_copy_pixels(struct AseFile* file, int pixel_data_index, uint8_t* dst, int pitch, int offset_x, int offset_y);
 // Software rendering.
 void ase_draw_cel_partial(struct AseFile* file, int frame, int layer, int src_x, int src_y, int src_w, int src_h, uint8_t* dst, int pitch, int offset_x, int offset_y);
@@ -179,8 +197,8 @@ enum AseStructType
 {
     ASE_END_OF_FILE         = 0,
     ASE_ERROR               = 1,
-    ASE_HEADER              = 2,
-    ASE_FRAME_HEADER        = 3,
+    ASE_HEADER              = 0xA5E0,
+    ASE_FRAME_HEADER        = 0xF1FA,
     ASE_CHUNK_HEADER        = 5,
     // 0x0004, 0x0011, 0x2016, 0x2017 are reserved for the deprecated chunk types
     ASE_LAYER               = 0x2004,
@@ -298,10 +316,10 @@ typedef struct ase_header_t{
 typedef struct ase_frame_header_t {
     uint32_t byte_length;     // Size of this frame (including this header)
     uint16_t magic;              // 0xF1FA
-    uint16_t old_chunk_count;    // 0xFFFF means use new field
+    uint16_t chunk_count_obsolete; // 0xFFFF
     uint16_t duration_ms;        // Frame duration in milliseconds
     uint8_t unused[2];          // Reserved
-    uint32_t new_chunk_count;    // Used if old_chunk_count == 0xFFFF
+    uint32_t chunk_count;    // Used if old_chunk_count == 0xFFFF
 } ase_frame_header_t;
 
 /* ========================= Chunk Header ========================= */
@@ -309,7 +327,6 @@ typedef struct ase_frame_header_t {
 typedef struct ase_chunk_header_t{
     uint32_t chunk_size;         // Includes size and type fields (≥6)
     uint16_t chunk_type;         // e.g., 0x2004, 0x2005, etc.
-    uint8_t chunk_data[];
 } ase_chunk_header_t;
 
 /* ========================= Chunk Type: 0x0004 and 0x0011 (Old Palette) ========================= */
@@ -371,7 +388,7 @@ typedef struct {
     uint8_t unused[3];
     uint16_t layer_name_length;
     char     layer_name[];
-} ase_layer_chunk_t;
+} ase_layer_t;
 
 /* ========================= Chunk Type: 0x2005 (Cel) ========================= */
 typedef enum ase_cel_type {
@@ -513,7 +530,7 @@ typedef struct {
     uint16_t flag_has_name:1;
     uint16_t:15; // Unused flags
     uint32_t rgba;
-    // if flags&1:
+    // if flag_has_name:
     uint16_t color_name_length;
     char color_name[];
 } ase_palette_entry_t;

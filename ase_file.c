@@ -1,4 +1,10 @@
-#include "ase_read.h"
+#include "ase_file.h"
+
+#define SINFL_IMPLEMENTATION
+#define SDEFL_IMPLEMENTATION
+#include "sinfl.h"
+#include "sdefl.h"
+
 #include <stdio.h>
 #include <stdlib.h> 
 #include <assert.h>
@@ -10,9 +16,9 @@
 
 #define PAD8(X) ((X + 7) & ~7)
 
-static int calc_layout(int num_frames, int num_layers, int num_cels, int num_tags, int num_pixel_data_blocks, int num_palettes, int num_slices, int string_length, int length, int max_compressed_size,
+static int calc_layout(int num_frames, int num_layers, int num_cels, int num_tags, int num_pixel_data_blocks, int num_palettes, int num_slices, int string_length, int pixel_length, int max_compressed_size,
                        int* off_frames, int* off_layers, int* off_cels, int* off_tags, 
-                       int* off_cel_header, int* off_palettes, int* off_slices, int* off_strings, int* off_data, int* off_temp_buffer)
+                       int* off_pixel_data_blocks, int* off_palettes, int* off_slices, int* off_strings, int* off_data, int* off_temp_buffer)
 {
     int offset = 0;
     offset += sizeof(struct AseFile);
@@ -34,7 +40,7 @@ static int calc_layout(int num_frames, int num_layers, int num_cels, int num_tag
     offset += num_tags * sizeof(struct AseTag);
     offset = PAD8(offset);
     
-    *off_cel_header = offset;
+    *off_pixel_data_blocks = offset;
     offset += num_pixel_data_blocks * sizeof(struct AsePixelData);
     offset = PAD8(offset);
     
@@ -46,12 +52,12 @@ static int calc_layout(int num_frames, int num_layers, int num_cels, int num_tag
     offset += num_slices * sizeof(struct AseSlice);
     offset = PAD8(offset);
     
-    *off_strings = offset;
-    offset += string_length;
+    *off_data = offset;
+    offset += pixel_length;
     offset = PAD8(offset);
 
-    *off_data = offset;
-    offset += length;
+    *off_strings = offset;
+    offset += string_length;
     offset = PAD8(offset);
     
     *off_temp_buffer = offset;
@@ -61,7 +67,52 @@ static int calc_layout(int num_frames, int num_layers, int num_cels, int num_tag
     return (int)offset;
 }
 
-static inline int ase_decompress(struct AseFile* file, uint8_t* source, int source_size, uint8_t* buffer, int buffer_size, void** decompressor);
+int ase_file_calculate_memory_needed(struct AseFile* file)
+{
+    int off_frames, off_layers, off_cels, off_tags, off_pixel_data_blocks, off_palettes, off_slices, off_strings, off_cel_bytes, off_temp_buffer;
+    int cel_pixel_bytes = file->width * file->height * file->bytes_per_pixel;
+    int pixel_bytes = cel_pixel_bytes * file->num_pixel_data_blocks;
+    return calc_layout(file->num_frames, file->num_layers, file->num_cels, file->num_tags, file->num_pixel_data_blocks, file->num_palettes, file->num_slices, 0, pixel_bytes, 0,
+                        &off_frames, &off_layers, &off_cels, &off_tags, &off_pixel_data_blocks, &off_palettes, &off_slices, &off_strings, &off_cel_bytes, &off_temp_buffer);
+}
+
+uint8_t* ase_file_init_with_buffer(struct AseFile* file, uint8_t* memory, int size)
+{
+    int off_frames, off_layers, off_cels, off_tags, off_pixel_data_blocks, off_palettes, off_slices, off_strings, off_cel_bytes, off_temp_buffer;
+    int cel_pixel_bytes = file->width * file->height * file->bytes_per_pixel;
+    int pixel_bytes = cel_pixel_bytes * file->num_pixel_data_blocks;
+    calc_layout(file->num_frames, file->num_layers, file->num_cels, file->num_tags, file->num_pixel_data_blocks, file->num_palettes, file->num_slices, 0, pixel_bytes, 0,
+                        &off_frames, &off_layers, &off_cels, &off_tags, &off_pixel_data_blocks, &off_palettes, &off_slices, &off_strings, &off_cel_bytes, &off_temp_buffer);
+    file->frames     = (struct AseFrame*)(memory + off_frames);
+    file->layers     = (struct AseLayer*)(memory + off_layers);
+    file->cels       = (struct AseCel*)(memory + off_cels);
+    file->tags       = (struct AseTag*)(memory + off_tags);
+    file->pixel_data = (struct AsePixelData*)(memory + off_pixel_data_blocks);
+    file->palettes   = (struct AsePalette*)(memory + off_palettes);
+    file->slices     = (struct AseSlice*)(memory + off_slices);
+    for(int i = 0; i < file->num_pixel_data_blocks; i++)
+    {
+        file->pixel_data[i].origin_cel = -1;
+    } 
+    for(int i = 0; i < file->num_layers; i++)
+    {
+        file->layers[i].opacity = 255;
+        file->layers[i].visible = true;
+    } 
+    for(int i = 0; i < file->num_cels; i++)
+    {
+        file->cels[i].opacity    = 255;
+        file->cels[i].draw_order = ase_get_layer_from_cel_idx(file, i)<<16;
+    }
+    uint8_t* pixel_data_tail = memory + off_cel_bytes;
+    for(int i = 0; i<file->num_pixel_data_blocks; i++)
+    {
+        file->pixel_data[i].data = pixel_data_tail;
+        pixel_data_tail += cel_pixel_bytes;
+    }
+    return memory + off_strings;
+}
+
 struct AseFile* ase_read_file(const char* path)
 {
     struct AseParser parser = ase_open_parser(path);
@@ -93,7 +144,7 @@ struct AseFile* ase_read_file(const char* path)
                 break;
             }
             case ASE_LAYER: {
-                ase_layer_chunk_t* layer = (ase_layer_chunk_t*)parser.element;
+                ase_layer_t* layer = (ase_layer_t*)parser.element;
                 num_layers++;
                 string_data_size += layer->layer_name_length + 1;
                 break;
@@ -158,16 +209,16 @@ struct AseFile* ase_read_file(const char* path)
         total_pixel_data_bytes = total_uncompressed_size;
     int num_cels = num_layers * num_frames;
 
-    int off_frames, off_layers, off_cels, off_tags, off_cel_header, off_palettes, off_slices, off_strings, off_cel_bytes, off_temp_buffer;
+    int off_frames, off_layers, off_cels, off_tags, off_pixel_data_blocks, off_palettes, off_slices, off_strings, off_cel_bytes, off_temp_buffer;
     int needed = calc_layout(num_frames, num_layers, num_cels, num_tags, num_pixel_data_blocks, num_palettes, num_slices, string_data_size, total_pixel_data_bytes, max_compressed_size,
                              &off_frames, &off_layers, &off_cels, &off_tags, 
-                             &off_cel_header, &off_palettes, &off_slices, &off_strings, &off_cel_bytes, &off_temp_buffer);
+                             &off_pixel_data_blocks, &off_palettes, &off_slices, &off_strings, &off_cel_bytes, &off_temp_buffer);
 
     /* Second parsing pass: populate structures */
     ase_reset_parser(&parser);
     struct AseFile* file = malloc(needed);
     uint8_t* memory = (uint8_t*)file;
-    memset(file, 0, sizeof(*file));
+    memset(memory, 0, needed);
     
     file->data = (char*)memory;
     file->data_length = needed;
@@ -176,7 +227,7 @@ struct AseFile* ase_read_file(const char* path)
     file->layers = (struct AseLayer*)(memory + off_layers);
     file->cels = (struct AseCel*)(memory + off_cels);
     file->tags = (struct AseTag*)(memory + off_tags);
-    file->pixel_data = (struct AsePixelData*)(memory + off_cel_header);
+    file->pixel_data = (struct AsePixelData*)(memory + off_pixel_data_blocks);
     file->palettes = (struct AsePalette*)(memory + off_palettes);
     file->slices = (struct AseSlice*)(memory + off_slices);
     
@@ -210,7 +261,6 @@ struct AseFile* ase_read_file(const char* path)
     struct AseUserData* last_user_data = NULL;
 
     int transparency_index = -1;
-    void* decompressor = NULL;
     while ((type = ase_parse_next(&parser)) != ASE_END_OF_FILE) {
         switch (type) {
             case ASE_HEADER: {
@@ -240,7 +290,7 @@ struct AseFile* ase_read_file(const char* path)
             }
             
             case ASE_LAYER: {
-                ase_layer_chunk_t* layer_data = (ase_layer_chunk_t*)parser.element;
+                ase_layer_t* layer_data = (ase_layer_t*)parser.element;
                 current_layer_idx++;
 
                 struct AseLayer* layer = &file->layers[current_layer_idx];
@@ -301,7 +351,7 @@ struct AseFile* ase_read_file(const char* path)
                             int dst_length = pixels->w * pixels->h * bytes_per_pixel;
                             // sinfl needs 8 byte aligned input
                             memcpy(temp_buffer, cel_elem->pixels, src_length);
-                            pixels->length = ase_decompress(file, temp_buffer, src_length, pixels->data, PAD8(dst_length), &decompressor);
+                            pixels->length = zsinflate(pixels->data, PAD8(dst_length), temp_buffer, src_length);
                             if(pixels->length == -1)
                             {
                                 fprintf(stderr, "ase_read: corrupted data block encountered during decompression");
@@ -363,6 +413,7 @@ struct AseFile* ase_read_file(const char* path)
                     file->frames[current_frame_idx].palette = current_palette;
                 
                 current_palette_entry_idx = pal_data->first_index;
+                current_palette->num_colors = pal_data->new_palette_size;
                 palette_idx++;
                 break;
             }
@@ -454,44 +505,217 @@ struct AseFile* ase_read_file(const char* path)
     }
     
     ase_close_parser(&parser);
-    #ifdef ASE_USE_LIBDEFLATE
-    libdeflate_free_decompressor(decompressor);
-    #endif
-
     return file;
 }
 
-#if defined(ASE_USE_LIBDEFLATE)
-#include <libdeflate.h>
-#elif defined(ASE_USE_MINIZ)
-#include "miniz.h"
-#else
-#define SINFL_IMPLEMENTATION
-#include "sinfl.h"
-#endif
-
-static inline int ase_decompress(struct AseFile* file, uint8_t* source, int source_size, uint8_t* buffer, int buffer_size, void** decompressor)
+static inline int ase_write_user_data(FILE* f, struct AseUserData data, bool always)
 {
-    #if defined(ASE_USE_LIBDEFLATE)
-    buffer = buffer;
-    struct libdeflate_decompressor* decomp = *decompressor;
-    if(*decompressor == NULL)
+    if(data.color == 0x0 && data.text == NULL && !always) return 0;
+    ase_chunk_header_t chunk_header = {
+        .chunk_type = CHUNK_USER_DATA,
+        .chunk_size = 0
+    };
+    int chunk_start = ftell(f);
+    fseek(f, sizeof(ase_chunk_header_t), SEEK_CUR);
+    ase_user_data_t user_data = {
+        .flag_has_color = (data.color != 0x0),
+        .flag_has_text = (data.text != NULL) && (data.text[0] != '\0'),
+        .flag_has_properties = false
+    };
+    fwrite(&user_data, sizeof(ase_user_data_t), 1, f);
+    if(user_data.flag_has_text)
     {
-        *decompressor = libdeflate_alloc_decompressor();
-        decomp = *decompressor;
+        uint16_t length = strlen(data.text);
+        fwrite(&length, 2, 1, f);
+        fwrite(data.text, length, 1, f);
     }
-    size_t actual_out_nbytes = 0;
-    if (libdeflate_zlib_decompress(decomp, source, (size_t)source_size, buffer, buffer_size, &actual_out_nbytes) != LIBDEFLATE_SUCCESS)
-        return -1;
-    return actual_out_nbytes;
-    #elif defined(ASE_USE_MINIZ)
-    uLongf size = buffer_size;
-    if(uncompress(buffer, &size, source, (unsigned long)source_size) != Z_OK)
-        return -1;
-    return size;
-    #else
-    return zsinflate(buffer, buffer_size, source, source_size);
-    #endif
+    if(user_data.flag_has_color)
+        fwrite(&data.color, 4, 1, f);
+    int chunk_end = ftell(f);
+    chunk_header.chunk_size = chunk_end - chunk_start;
+    fseek(f, chunk_start, SEEK_SET);
+    fwrite(&chunk_header, sizeof(ase_chunk_header_t), 1, f);
+    fseek(f, chunk_end, SEEK_SET);
+    return 1;
+}
+
+bool ase_write_file(struct AseFile* file, const char* path)
+{
+    // [File](User Data)
+    // [Frame][Palette][Tags][Layers](UserData)[Cels](UserData)
+    // [Frame][Palette][Cels](UserData)
+    uint32_t file_size = 0;
+    int transparent_index = 0;
+    if(file->bytes_per_pixel == 1)
+    if(file->num_palettes > 0)
+    for(int i = 0; i < file->palettes[0].num_colors; i++)
+        if((file->palettes[0].colors[i] & 0x000000FF) == 0)
+            transparent_index = i;
+
+    FILE* output = fopen(path, "wb");
+    if(output == NULL) return false;
+
+    struct sdefl sdefl = {};
+    char* compression_buffer = NULL;
+    int compression_buffer_size = 0;
+    for(int i = 0; i<file->num_pixel_data_blocks; i++)
+    {
+        int memory_needed = sdefl_bound(file->pixel_data[i].length);
+        if(memory_needed > compression_buffer_size)
+            compression_buffer_size = memory_needed;
+    }
+    if(compression_buffer_size > 0)
+    {
+        compression_buffer = malloc(compression_buffer_size);
+        if(compression_buffer == NULL)
+        {
+            fclose(output);
+            return false;
+        }
+    }
+
+    #define WRITE(VAR) fwrite(&VAR, sizeof(VAR), 1, output)
+
+    long file_start = ftell(output);
+    ase_header_t header = {
+        .magic = 0xA5E0,
+        .file_size = 0,
+        .frames = file->num_frames,
+        .width = file->width,
+        .height = file->height,
+        .color_depth = file->bytes_per_pixel*8,
+        .flag_layers_have_uuid = false,
+        .flag_layer_opacity = true,
+        .flag_group_blend = false,
+        .transparent_index = transparent_index,
+        .pixel_height = file->pixel_ratio_y == 0 ? 1 : file->pixel_ratio_y,
+        .pixel_width = file->pixel_ratio_x == 0 ? 1 : file->pixel_ratio_x
+    };
+    fseek(output, sizeof(ase_header_t), SEEK_CUR);
+    
+    struct AsePalette* cur_palette = NULL;
+    long chunk_start = 0;
+    long chunk_end = 0;
+
+    #define START_CHUNK() { chunk_start = ftell(output);\
+                          fseek(output, sizeof(ase_chunk_header_t), SEEK_CUR); }
+    #define END_CHUNK(CHUNK_ID) { chunk_end = ftell(output);\
+         fseek(output, chunk_start, SEEK_SET);\
+         fwrite(&(ase_chunk_header_t){.chunk_size = chunk_end - chunk_start, .chunk_type = CHUNK_ID}, sizeof(ase_chunk_header_t), 1, output);\
+         fseek(output, chunk_end, SEEK_SET); frame_header.chunk_count++; }
+    #define WRITE_CHUNK(VAR, CHUNK_ID) START_CHUNK(); WRITE(VAR); END_CHUNK(CHUNK_ID)
+
+    for(int f = 0; f < file->num_frames; f++)
+    {
+        int frame_start = ftell(output);
+        ase_frame_header_t frame_header = {
+            .magic=0xF1FA, .duration_ms = file->frames[f].duration * 1000.0,
+            .chunk_count_obsolete = 0,
+            .chunk_count = 0,
+            .byte_length = 0,
+        };
+        // Skip for now, we will write later once .byte_length and .chunk_count are set.
+        fseek(output, sizeof(ase_frame_header_t), SEEK_CUR);
+
+        if(file->frames[f].palette != cur_palette)
+        {
+            START_CHUNK();
+            cur_palette = file->frames[f].palette;
+            ase_palette_t palette = {.first_index = 0, .last_index = cur_palette->num_colors-1, .new_palette_size = cur_palette->num_colors};
+            WRITE(palette);
+            for(int i = 0; i < cur_palette->num_colors; i++)
+            {
+                uint16_t flags = 0;
+                uint32_t color = cur_palette->colors[i];
+                WRITE(flags);
+                WRITE(color);
+            }
+            END_CHUNK(CHUNK_PALETTE);
+        }
+
+        if(f==0)
+        {
+            frame_header.chunk_count += ase_write_user_data(output, file->user_data, false);
+
+            START_CHUNK();
+            ase_tags_t tags = {.num_tags = file->num_tags};
+            WRITE(tags);
+            for(int i = 0; i < file->num_tags; i++)
+            {
+                ase_tag_t tag = {.from = file->tags[i].start_frame, .to = file->tags[i].end_frame};
+                if(file->tags[i].name)
+                    tag.name_length = strlen(file->tags[i].name);
+                WRITE(tag);
+                if(file->tags[i].name)
+                    fwrite(file->tags[i].name, tag.name_length, 1, output);
+            }
+            END_CHUNK(CHUNK_TAGS);
+            for(int i = 0; i < file->num_tags; i++)
+                frame_header.chunk_count += ase_write_user_data(output, file->tags[i].user_data, true);
+
+            for(int i = 0; i < file->num_layers; i++)
+            {
+                START_CHUNK();
+                struct AseLayer* l = &file->layers[i];
+                ase_layer_t layer = {
+                    .blend_mode   = l->blend_mode, 
+                    .flag_visible = l->visible, .opacity = l->opacity,
+                    .child_level  = l->depth, .type = l->is_group ? LAYER_GROUP : LAYER_NORMAL};
+                if(l->name)
+                    layer.layer_name_length = strlen(l->name);
+                WRITE(layer);
+                if(l->name)
+                    fwrite(l->name, layer.layer_name_length, 1, output);
+                END_CHUNK(CHUNK_LAYER);
+                frame_header.chunk_count += ase_write_user_data(output, l->user_data, false);
+            }
+        }
+
+        for(int layer = 0; layer < file->num_layers; layer++)
+        {
+            int cel_idx = f * file->num_layers + layer;
+            struct AseCel* c = &file->cels[cel_idx];
+            if(c->pixel_data_index == -1)
+                continue;
+
+            struct AsePixelData* pdata = &file->pixel_data[c->pixel_data_index]; 
+            START_CHUNK();
+            ase_cel_t cel = {.layer_idx = layer, .opacity = c->opacity, .x = c->x, .y = c->y, .z_index = c->z_index};
+            if(pdata->origin_cel != cel_idx && pdata->origin_cel != -1)
+            {
+                cel.cel_type = CEL_LINKED;
+                cel.linked.frame = ase_get_frame_from_cel_idx(file, pdata->origin_cel);
+                fwrite(&cel, offsetof(ase_cel_t, linked.frame)+sizeof(cel.linked.frame), 1, output);
+            }
+            else
+            {
+                cel.cel_type = CEL_COMPRESSED_IMAGE;
+                cel.w = pdata->w;
+                cel.h = pdata->h;
+
+                fwrite(&cel, offsetof(ase_cel_t, pixels), 1, output);
+                int compressed_size = zsdeflate(&sdefl, compression_buffer, pdata->data, pdata->length, ASE_COMPRESSION_LEVEL);
+                fwrite(compression_buffer, compressed_size, 1, output);
+            }
+            END_CHUNK(CHUNK_CEL);
+            frame_header.chunk_count += ase_write_user_data(output, c->user_data, false);
+        }
+
+        long frame_end = ftell(output);
+        fseek(output, frame_start, SEEK_SET);
+        frame_header.byte_length = frame_end - frame_start;
+        frame_header.chunk_count_obsolete = frame_header.chunk_count < UINT16_MAX ? frame_header.chunk_count : UINT16_MAX;
+        WRITE(frame_header);
+        fseek(output, frame_end, SEEK_SET);
+    }
+    long file_end = ftell(output);
+    fseek(output, file_start, SEEK_SET);
+    header.file_size = file_end - file_start;
+    WRITE(header);
+    fseek(output, file_end, SEEK_SET);
+    free(compression_buffer);
+    fclose(output);
+    return true;
 }
 
 void ase_free_file(struct AseFile* file)
@@ -1016,10 +1240,18 @@ static inline void* advance(struct AseParser* p, int size, enum AseStructType ty
     p->element_type = type;
     p->cur += size;
     assert(size != 0);
-    /*printf("[%16.16s (%04X): Offset % 4d Size %d]", ase_struct_type_name(p->element_type), p->element_type, ((char*)p->element - p->data), p->element_size);
+    #ifdef ASE_VERBOSE
+    if(p->element_type == ASE_CHUNK_HEADER)
+    {
+        ase_chunk_header_t* header = (ase_chunk_header_t*)p->element;
+        printf("[CHUNK%11.16s (%04X): Offset % 4d Size %d", ase_struct_type_name(header->chunk_type), header->chunk_type, ((char*)p->element - p->data), header->chunk_size);
+    }
+    else
+        printf("[%16.16s (%04X): Offset % 4d Size %d", ase_struct_type_name(p->element_type), p->element_type, ((char*)p->element - p->data), p->element_size);
     if(p->cur_chunk_remaining_entries > 0)
         printf(" +%d", p->cur_chunk_remaining_entries);
-    printf("\n");*/
+    printf("]\n");
+    #endif
     return old_parser_cur;
 }
 
@@ -1032,13 +1264,15 @@ enum AseStructType ase_parse_next(struct AseParser* p)
         advance(p, sizeof(ase_header_t), ASE_HEADER);
         return ASE_HEADER;
     }
-    else // Frame Data`
+    else // Frame Data
     {
         if(p->cur_frame_remaining_chunks == 0  || p->cur == p->next_frame_start)
         {
             ase_frame_header_t* header = (ase_frame_header_t*)advance(p, sizeof(ase_frame_header_t), ASE_FRAME_HEADER);
             if(header->magic != 0xF1FA){ fprintf(stderr, "ase-read: encountered wrong magic bytes\n"); p->error = ASE_PARSER_ERROR; return ASE_ERROR; }
-            p->cur_frame_remaining_chunks = (header->new_chunk_count != 0 ? header->new_chunk_count : header->old_chunk_count) + 1;
+            //p->cur_frame_remaining_chunks = (header->chunk_count != 0 ? header->chunk_count : header->chunk_count_obsolete) + 1;
+            // The above works, but this one matches Aseprite behaviour.
+            p->cur_frame_remaining_chunks = (header->chunk_count_obsolete == 0xFFFF ? header->chunk_count : header->chunk_count_obsolete) + 1;
             p->next_frame_start = (char*)header + header->byte_length;
             p->next_chunk_start = (char*)header + sizeof(ase_frame_header_t);
             //printf("-- Next Frame %d Next chunk %d\n", p->next_frame_start - p->data, p->next_chunk_start - p->data);
@@ -1115,8 +1349,8 @@ enum AseStructType ase_parse_next(struct AseParser* p)
             }
             else if(p->current_chunk_type == CHUNK_LAYER)
             {
-                int size = sizeof(ase_layer_chunk_t);
-                ase_layer_chunk_t* header = (ase_layer_chunk_t*)p->cur;
+                int size = sizeof(ase_layer_t);
+                ase_layer_t* header = (ase_layer_t*)p->cur;
                 size += header->layer_name_length;
                 if(header->type == 2) size += 4;
                 if(p->file_header->flag_layers_have_uuid == 1) size += 16;
