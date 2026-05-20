@@ -571,25 +571,25 @@ typedef struct {
 } ase_property_name_t;
 
 typedef enum {
-    TYPE_BOOL, // uint8_t
-    TYPE_INT8,
-    TYPE_UINT8,
-    TYPE_INT16,
-    TYPE_UINT16,
-    TYPE_INT32,
-    TYPE_UINT32,
-    TYPE_INT64,
-    TYPE_UINT64,
-    TYPE_FIXED16_16, // 2 uint16_t
-    TYPE_FLOAT,
-    TYPE_DOUBLE,
-    TYPE_STRING, // uint16t size + char[]
-    TYPE_POINT, // 2 int32_t
-    TYPE_SIZE, // 2 uint32_t
-    TYPE_RECT, // POINT + SIZE
-    TYPE_VECTOR, // It's complicated, see the spec.
-    TYPE_PROPERTY_MAP, // Oh no. Recursion.
-    TYPE_UUID // uint8_t[16]
+    ASE_PROPTYPE_BOOL, // uint8_t
+    ASE_PROPTYPE_INT8,
+    ASE_PROPTYPE_UINT8,
+    ASE_PROPTYPE_INT16,
+    ASE_PROPTYPE_UINT16,
+    ASE_PROPTYPE_INT32,
+    ASE_PROPTYPE_UINT32,
+    ASE_PROPTYPE_INT64,
+    ASE_PROPTYPE_UINT64,
+    ASE_PROPTYPE_FIXED16_16, // 2 uint16_t
+    ASE_PROPTYPE_FLOAT,
+    ASE_PROPTYPE_DOUBLE,
+    ASE_PROPTYPE_STRING, // uint16t size + char[]
+    ASE_PROPTYPE_POINT, // 2 int32_t
+    ASE_PROPTYPE_SIZE, // 2 uint32_t
+    ASE_PROPTYPE_RECT, // POINT + SIZE
+    ASE_PROPTYPE_VECTOR, // It's complicated, see the spec.
+    ASE_PROPTYPE_PROPERTY_MAP, // Oh no. Recursion.
+    ASE_PROPTYPE_UUID // uint8_t[16]
 } ase_property_type_t;
 
 typedef struct {
